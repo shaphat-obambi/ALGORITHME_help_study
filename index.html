@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cahier — Interpréteur de pseudo-code</title>
+<meta name="description" content="Interpréteur et exécuteur de pseudo-code en français, pour l'enseignement de l'algorithmique.">
+
+<!-- Progressive Web App : permet d'« installer » l'outil comme une
+     application native sur Windows, macOS, Linux, ChromeOS, Android et iOS,
+     avec fenêtre autonome et usage hors-ligne. -->
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0e1120">
+<link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Cahier_algo">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+
+  <div class="brand">
+    <h1 id="brandLogo">Cahier<span class="dot">_</span>algo</h1>
+    <p id="brandSubtitle">interpréteur de pseudo-code en français</p>
+  </div>
+
+  <nav class="menubar" id="menubar" aria-label="Menu principal">
+    <div class="menu" data-menu="fichier">
+      <button class="menu-trigger" type="button" aria-haspopup="true" aria-expanded="false">Fichier</button>
+      <div class="menu-panel" role="menu">
+        <button class="menu-item" type="button" data-action="new">🆕 Nouveau</button>
+        <button class="menu-item" type="button" data-action="open">📂 Ouvrir… <span class="mk">Ctrl+O</span></button>
+        <button class="menu-item" type="button" data-action="save">💾 Enregistrer (.algo) <span class="mk">Ctrl+S</span></button>
+        <div class="menu-sep"></div>
+        <div class="menu-label">Charger un exemple</div>
+        <div class="menu-sublist" id="menuExamples"></div>
+        <div class="menu-sep"></div>
+        <button class="menu-item" type="button" data-action="print">🖨️ Imprimer / Exporter PDF</button>
+        <button class="menu-item" type="button" data-action="export-console">📄 Exporter la console (.log)</button>
+        <div class="menu-sep"></div>
+        <button class="menu-item" type="button" data-action="close">✕ Fermer</button>
+      </div>
+    </div>
+
+    <div class="menu" data-menu="affichage">
+      <button class="menu-trigger" type="button" aria-haspopup="true" aria-expanded="false">Affichage</button>
+      <div class="menu-panel" role="menu">
+        <div class="menu-label">Taille de police</div>
+        <div class="menu-choice-group" id="fontSizeGroup">
+          <button type="button" data-fontsize="12">12px</button>
+          <button type="button" data-fontsize="14" class="active">14px</button>
+          <button type="button" data-fontsize="18">18px</button>
+          <button type="button" data-fontsize="22">22px</button>
+        </div>
+        <div class="menu-sep"></div>
+        <div class="menu-label">Thème</div>
+        <div class="menu-choice-group" id="themeGroup">
+          <button type="button" data-theme-choice="dark" class="active">🌙 Sombre</button>
+          <button type="button" data-theme-choice="light">☀️ Clair</button>
+        </div>
+        <div class="menu-sep"></div>
+        <button class="menu-item" type="button" id="toggleLineNumbers">☑ Numéros de lignes</button>
+      </div>
+    </div>
+
+    <div class="menu" data-menu="execution">
+      <button class="menu-trigger" type="button" aria-haspopup="true" aria-expanded="false">Exécution</button>
+      <div class="menu-panel" role="menu">
+        <button class="menu-item run-trigger" type="button">▶ Lancer <span class="mk">Ctrl+↵</span></button>
+        <button class="menu-item stop-trigger" type="button" disabled>⏹ Arrêter</button>
+        <div class="menu-sep"></div>
+        <button class="menu-item" type="button" data-action="clear-console">🧹 Effacer la console</button>
+      </div>
+    </div>
+
+    <div class="menu" data-menu="aide">
+      <button class="menu-trigger" type="button" aria-haspopup="true" aria-expanded="false">Infos / Aide</button>
+      <div class="menu-panel" role="menu">
+        <button class="menu-item" type="button" data-action="syntax-guide">📖 Guide de syntaxe</button>
+        <button class="menu-item" type="button" data-action="about">ℹ️ À propos de SOFT-KEY</button>
+      </div>
+    </div>
+  </nav>
+
+  <div class="toolbar-quick">
+    <button class="run-trigger" type="button">▶ Exécuter <span class="k">Ctrl+↵</span></button>
+    <button class="stop-trigger" type="button" disabled>⏹ Arrêter</button>
+    <a class="btn-download-win" href="/download/win">💻 Télécharger pour Windows (.exe)</a>
+  </div>
+</header>
+
+<input type="file" id="fileInput" accept=".algo,.txt,text/plain" hidden>
+<pre id="printArea"></pre>
+
+<main>
+  <section class="pane">
+    <div class="pane-head">
+      <span>Éditeur</span>
+      <span id="lineCount">1 ligne</span>
+    </div>
+    <div class="editor-wrap">
+      <div id="gutter"><span>1</span></div>
+      <div class="code-layer">
+        <pre id="highlight" aria-hidden="true"><code id="highlightCode"></code></pre>
+        <textarea id="code" spellcheck="false" autocapitalize="off" autocorrect="off"></textarea>
+        <ul id="autocomplete" class="autocomplete-box" hidden role="listbox" aria-label="Suggestions"></ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="pane">
+    <div class="pane-head">
+      <span>Console</span>
+    </div>
+    <div id="console" role="log" aria-live="polite"></div>
+  </section>
+</main>
+
+<footer>
+  <span class="statusbar-status"><span id="statusDot" class="status-dot ready"></span><span id="statusText">Prêt</span></span>
+  <span class="statusbar-cheatsheet">
+    <span id="devCredit">Développé par <strong>SOFT-KEY</strong> avec l'assistance de l'IA</span>
+    <span class="footer-sep">·</span>
+    <span>Si/SinonSi/Sinon/FinSi — Selon/Cas/Autrement/FinSelon — Pour/FinPour — TantQue/FinTantQue — Répéter…Jusqu'à — Lire()/Ecrire()/Ord()</span>
+  </span>
+</footer>
+
+<!-- Modale générique : Guide de syntaxe / À propos -->
+<div class="modal-overlay" id="modalOverlay" hidden>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-head">
+      <h2 id="modalTitle"></h2>
+      <button class="modal-close" id="modalClose" type="button" aria-label="Fermer">✕</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
