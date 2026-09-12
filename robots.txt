@@ -1,0 +1,3 @@
+user-agent: *
+Allow: /
+Sitemap: https://cahier-algo.ddsn.net/sitemap.xml
