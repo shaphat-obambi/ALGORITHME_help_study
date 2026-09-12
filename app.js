@@ -50,6 +50,10 @@ const INSTITUTION_CONFIG = {
     repeter: {
       label: "5. Répéter…Jusqu'à — saisie contrôlée",
       code: `Algorithme SaisieControlee\nVariables\n    nombre : Entier\nDébut\n    Répéter\n        Ecrire("Entrez un nombre entre 1 et 10 : ")\n        Lire(nombre)\n        Si nombre < 1 Ou nombre > 10 Alors\n            Ecrire("Valeur hors limites, réessayez.")\n        FinSi\n    Jusqu'à nombre >= 1 Et nombre <= 10\n    Ecrire("Merci, valeur validée : ", nombre)\nFin`
+    },
+    fonctionsProcedures: {
+      label: "6. Fonction & Procédure — nombre premier",
+      code: `Algorithme DemoFonctionsProcedures\n\nFonction EstPremier(n) : Booleen\nVariables\n    i : Entier\n    premier : Booleen\nDébut\n    Si n < 2 Alors\n        Retourner Faux\n    FinSi\n    premier <- Vrai\n    Pour i De 2 À n - 1 Faire\n        Si n Mod i = 0 Alors\n            premier <- Faux\n        FinSi\n    FinPour\n    Retourner premier\nFinFonction\n\nProcédure AfficherResultat(nombre, estPremierResultat)\nDébut\n    Si estPremierResultat Alors\n        Ecrire(nombre, " est un nombre premier.")\n    Sinon\n        Ecrire(nombre, " n'est pas un nombre premier.")\n    FinSi\nFinProcédure\n\nVariables\n    n : Entier\n    resultat : Booleen\nDébut\n    Ecrire("Entrez un nombre entier : ")\n    Lire(n)\n    resultat <- EstPremier(n)\n    Appeler AfficherResultat(n, resultat)\nFin`
     }
   }
 };
@@ -68,6 +72,16 @@ class PseudoError extends Error{
    de programme, juste une interruption volontaire ; traitée séparément
    dans l'UI (message neutre, pas de préfixe "Erreur"). */
 class StopRequested extends Error{}
+
+/* Signal de contrôle interne pour "Retourner"/"Retourne" à l'intérieur d'une
+   Fonction/Procédure : remonte jusqu'au point d'appel (invokeCallable) via
+   les mêmes mécanismes JS que StopRequested, mais n'est JAMAIS une erreur
+   utilisateur — si elle s'échappe jusqu'au programme principal (Retourner
+   utilisé hors de toute Fonction/Procédure), Interpreter.run() la convertit
+   en PseudoError explicite. */
+class ReturnSignal{
+  constructor(value, line){ this.value = value; this.line = line; }
+}
 
 /* ============================================================
    TOKENISATION
@@ -244,6 +258,35 @@ function defaultForType(type){
     default: return '';
   }
 }
+/* Évaluateur d'expression CONSTANTE, utilisé uniquement à l'analyse pour la
+   taille d'un tableau (ex. Tableau[2+3] de Entiers). Volontairement séparé
+   de evalExpr (qui doit pouvoir être asynchrone pour appeler des Fonctions
+   utilisateur) : à ce stade, aucune variable ni fonction n'existe encore. */
+function evalConstNumericExpr(node, line){
+  switch(node.type){
+    case 'Num': return node.value;
+    case 'Un': {
+      const v = evalConstNumericExpr(node.expr, line);
+      if(node.op === '-') return -v;
+      if(node.op === '+') return +v;
+      throw new PseudoError('Expression constante invalide pour une taille de tableau.', line);
+    }
+    case 'Bin': {
+      const l = evalConstNumericExpr(node.left, line);
+      const r = evalConstNumericExpr(node.right, line);
+      switch(node.op){
+        case '+': return l + r;
+        case '-': return l - r;
+        case '*': return l * r;
+        case '/': return l / r;
+        default: throw new PseudoError('Expression constante invalide pour une taille de tableau.', line);
+      }
+    }
+    default:
+      throw new PseudoError('Une taille de tableau doit être un nombre ou une expression arithmétique constante.', line);
+  }
+}
+
 function parseDeclarationGroup(tokens, line){
   const colonIdx = tokens.indexOf(':');
   if(colonIdx <= 0) throw new PseudoError(`Déclaration invalide : "${tokens.join(' ')}" (":" manquant ou nom absent)`, line);
@@ -259,7 +302,7 @@ function parseDeclarationGroup(tokens, line){
     let size = NaN;
     if(sizeTokens.length === 1 && /^\d+$/.test(sizeTokens[0])) size = parseInt(sizeTokens[0], 10);
     else{
-      try{ const v = evalExpr(parseExprTokens(sizeTokens, line), new Env(), line); if(typeof v === 'number') size = Math.trunc(v); }
+      try{ const v = evalConstNumericExpr(parseExprTokens(sizeTokens, line), line); if(typeof v === 'number') size = Math.trunc(v); }
       catch(e){ /* laissé à NaN */ }
     }
     if(!Number.isInteger(size) || size <= 0) throw new PseudoError(`Taille de tableau invalide pour "${name}"`, line);
@@ -279,24 +322,92 @@ class Parser{
   advance(){ return this.lines[this.pos++]; }
   lastLineNum(){ return this.lines.length ? this.lines[this.lines.length - 1].num : 0; }
 
+  /* Consomme un bloc "Variables" (mot-clé déjà repéré via currentKW() ===
+     'variables') et retourne la liste de déclarations. Réutilisé pour les
+     variables globales du programme ET pour les variables locales d'une
+     Fonction/Procédure. S'arrête au premier mot-clé de `stopSet`. */
+  parseDeclarationBlock(stopSet){
+    const groups = [];
+    const first = this.advance(); // la ligne "Variables"
+    const pushLine = (tokens, num) => {
+      if(tokens.length === 0) return;
+      for(const g of splitTopLevelCommas(tokens)) if(g.length) groups.push({ tokens: g, num });
+    };
+    pushLine(first.tokens.slice(1), first.num);
+    while(!this.atEnd() && !stopSet.has(this.currentKW())){
+      const l = this.advance();
+      pushLine(l.tokens, l.num);
+    }
+    return groups.map((g) => parseDeclarationGroup(g.tokens, g.num));
+  }
+
+  /* Déclaration "Fonction Nom(p1, p2) : Type ... Début ... Retourner ... FinFonction"
+     ou "Procédure Nom(p1, p2) ... Début ... FinProcédure". */
+  parseCallableDecl(kind){
+    const isFunc = kind === 'fonction';
+    const label = isFunc ? 'Fonction' : 'Procédure';
+    const finKw = isFunc ? 'finfonction' : 'finprocedure';
+    const header = this.advance();
+    const tokens = header.tokens;
+
+    const name = tokens[1];
+    if(!name || !isIdentToken(name)) throw new PseudoError(`Nom de ${label.toLowerCase()} attendu après "${label}".`, header.num);
+    if(tokens[2] !== '(') throw new PseudoError(`Attendu "(" après le nom de la ${label.toLowerCase()}.`, header.num);
+    const closeParen = findMatchingBracket(tokens, 2);
+    if(closeParen === -1) throw new PseudoError('Parenthèse non fermée dans la déclaration.', header.num);
+    const paramTokens = tokens.slice(3, closeParen);
+    const params = paramTokens.length ? splitTopLevelCommas(paramTokens).map((g) => {
+      if(g.length !== 1 || !isIdentToken(g[0])) throw new PseudoError(`Paramètre invalide dans la déclaration de "${name}".`, header.num);
+      return g[0];
+    }) : [];
+
+    let returnType = null;
+    if(isFunc){
+      if(tokens[closeParen + 1] !== ':') throw new PseudoError(`Type de retour manquant (": Type") après les paramètres de la fonction "${name}".`, header.num);
+      const typeTok = tokens[closeParen + 2];
+      if(!typeTok) throw new PseudoError(`Type de retour manquant pour la fonction "${name}".`, header.num);
+      returnType = normalizeTypeName(typeTok);
+    }
+
+    let localDecls = [];
+    if(this.currentKW() === 'variables'){
+      localDecls = this.parseDeclarationBlock(new Set(['debut']));
+    }
+
+    if(this.currentKW() !== 'debut') throw new PseudoError(`Mot-clé "Début" manquant dans la déclaration de "${label} ${name}".`, header.num);
+    this.advance();
+
+    const body = this.parseBlock(new Set([finKw]));
+    if(this.currentKW() !== finKw) throw new PseudoError(`Mot-clé "${isFunc ? 'FinFonction' : 'FinProcédure'}" manquant pour "${name}".`, header.num);
+    this.advance();
+
+    return { name, params, returnType, localDecls, body, isFunc, line: header.num };
+  }
+
   parseProgram(){
     if(this.lines.length === 0) throw new PseudoError('Le programme est vide.', 0);
     if(this.currentKW() === 'algorithme') this.advance();
 
     const declarations = [];
-    if(this.currentKW() === 'variables'){
-      const groups = [];
-      const first = this.advance();
-      const pushLine = (tokens, num) => {
-        if(tokens.length === 0) return;
-        for(const g of splitTopLevelCommas(tokens)) if(g.length) groups.push({ tokens: g, num });
-      };
-      pushLine(first.tokens.slice(1), first.num);
-      while(!this.atEnd() && this.currentKW() !== 'debut'){
-        const l = this.advance();
-        pushLine(l.tokens, l.num);
+    const functions = {};
+    const procedures = {};
+
+    // Variables, Fonction et Procédure peuvent apparaître dans n'importe
+    // quel ordre avant "Début", chacun étant reconnu par son mot-clé.
+    while(!this.atEnd() && this.currentKW() !== 'debut'){
+      const kw = this.currentKW();
+      if(kw === 'variables'){
+        declarations.push(...this.parseDeclarationBlock(new Set(['debut', 'fonction', 'procedure'])));
+      } else if(kw === 'fonction'){
+        const decl = this.parseCallableDecl('fonction');
+        functions[KW(decl.name)] = decl;
+      } else if(kw === 'procedure'){
+        const decl = this.parseCallableDecl('procedure');
+        procedures[KW(decl.name)] = decl;
+      } else {
+        const badLine = this.peekLine();
+        throw new PseudoError(`Élément inattendu avant "Début" : "${badLine.tokens.join(' ')}"`, badLine.num);
       }
-      for(const g of groups) declarations.push(parseDeclarationGroup(g.tokens, g.num));
     }
 
     if(this.currentKW() !== 'debut') throw new PseudoError('Mot-clé "Début" manquant.', this.atEnd() ? this.lastLineNum() : this.peekLine().num);
@@ -307,7 +418,7 @@ class Parser{
     if(this.currentKW() !== 'fin') throw new PseudoError('Mot-clé "Fin" manquant (fin du fichier atteinte).', this.lastLineNum());
     this.advance();
 
-    return { declarations, body };
+    return { declarations, functions, procedures, body };
   }
 
   parseBlock(stopSet){
@@ -445,6 +556,36 @@ class Parser{
       return { type:'Ecrire', args, line: line.num };
     }
 
+    if(kw === 'retourner' || kw === 'retourne'){
+      const exprTokens = tokens.slice(1);
+      const expr = exprTokens.length ? parseExprTokens(exprTokens, line.num) : null;
+      return { type:'Retourner', expr, line: line.num };
+    }
+
+    if(kw === 'appeler'){
+      const rest = tokens.slice(1);
+      if(rest.length === 0 || !isIdentToken(rest[0])) throw new PseudoError('Nom de procédure attendu après "Appeler".', line.num);
+      const name = rest[0];
+      if(rest[1] !== '(') throw new PseudoError(`Attendu "(" après "${name}".`, line.num);
+      const close = findMatchingBracket(rest, 1);
+      if(close === -1 || close !== rest.length - 1) throw new PseudoError('Parenthèse non fermée dans l\'appel.', line.num);
+      const argTokens = rest.slice(2, close);
+      const args = argTokens.length ? splitTopLevelCommas(argTokens).map((g) => parseExprTokens(g, line.num)) : [];
+      return { type:'AppelProcedure', name, args, line: line.num };
+    }
+
+    /* Appel de procédure sans "Appeler" : NomProc(args) seul sur la ligne
+       (aucun opérateur d'affectation après la parenthèse fermante). À
+       distinguer de l'affectation ci-dessous, qui exige "<-"/"=" après. */
+    if(isIdentToken(tokens[0]) && tokens[1] === '('){
+      const close = findMatchingBracket(tokens, 1);
+      if(close !== -1 && close === tokens.length - 1){
+        const argTokens = tokens.slice(2, close);
+        const args = argTokens.length ? splitTopLevelCommas(argTokens).map((g) => parseExprTokens(g, line.num)) : [];
+        return { type:'AppelProcedure', name: tokens[0], args, line: line.num };
+      }
+    }
+
     /* Affectation : nom [ '[' expr ']' ] ('<-'|'=') expression */
     const name = tokens[0];
     if(!isIdentToken(name)) throw new PseudoError(`Instruction non reconnue : "${tokens.join(' ')}"`, line.num);
@@ -514,7 +655,7 @@ const BUILTIN_FUNCTIONS = {
   },
 };
 
-function evalExpr(node, env, line){
+async function evalExpr(node, env, line, interp){
   switch(node.type){
     case 'Num': return node.value;
     case 'Str': return node.value;
@@ -523,29 +664,39 @@ function evalExpr(node, env, line){
     case 'Index': {
       const entry = env.getEntry(node.name, line);
       if(entry.type !== 'tableau') throw new PseudoError(`"${node.name}" n'est pas un tableau.`, line);
-      const i = Math.trunc(evalExpr(node.index, env, line));
+      const i = Math.trunc(await evalExpr(node.index, env, line, interp));
       if(!Number.isInteger(i) || i < 0 || i >= entry.size)
         throw new PseudoError(`Indice ${i} hors limites pour le tableau "${node.name}" (taille ${entry.size}, indices valides de 0 à ${entry.size - 1}).`, line);
       return entry.value[i];
     }
     case 'Call': {
-      const fn = BUILTIN_FUNCTIONS[KW(node.name)];
-      if(!fn) throw new PseudoError(`Fonction "${node.name}" inconnue.`, line);
-      const argValues = node.args.map((a) => evalExpr(a, env, line));
-      return fn(argValues, line, node.name);
+      const key = KW(node.name);
+      const argValues = [];
+      for(const a of node.args) argValues.push(await evalExpr(a, env, line, interp));
+
+      const builtin = BUILTIN_FUNCTIONS[key];
+      if(builtin) return builtin(argValues, line, node.name);
+
+      if(interp && interp.functions && interp.functions[key]){
+        return await interp.callFunction(key, argValues, line);
+      }
+      if(interp && interp.procedures && interp.procedures[key]){
+        throw new PseudoError(`"${node.name}" est une procédure : elle ne renvoie pas de valeur et ne peut pas être utilisée dans une expression. Utilisez une Fonction, ou "Appeler ${node.name}(...)" comme instruction séparée.`, line);
+      }
+      throw new PseudoError(`Fonction "${node.name}" inconnue.`, line);
     }
     case 'Un': {
-      const v = evalExpr(node.expr, env, line);
+      const v = await evalExpr(node.expr, env, line, interp);
       if(node.op === '-') return -Number(v);
       if(node.op === '+') return +Number(v);
       if(node.op === 'non') return !truthy(v);
       throw new PseudoError(`Opérateur unaire inconnu "${node.op}".`, line);
     }
     case 'Bin': {
-      if(node.op === 'et') return truthy(evalExpr(node.left, env, line)) ? truthy(evalExpr(node.right, env, line)) : false;
-      if(node.op === 'ou') return truthy(evalExpr(node.left, env, line)) ? true : truthy(evalExpr(node.right, env, line));
-      const l = evalExpr(node.left, env, line);
-      const r = evalExpr(node.right, env, line);
+      if(node.op === 'et') return truthy(await evalExpr(node.left, env, line, interp)) ? truthy(await evalExpr(node.right, env, line, interp)) : false;
+      if(node.op === 'ou') return truthy(await evalExpr(node.left, env, line, interp)) ? true : truthy(await evalExpr(node.right, env, line, interp));
+      const l = await evalExpr(node.left, env, line, interp);
+      const r = await evalExpr(node.right, env, line, interp);
       switch(node.op){
         case '+': return (typeof l === 'string' || typeof r === 'string') ? String(l) + String(r) : (Number(l) + Number(r));
         case '-': return Number(l) - Number(r);
@@ -615,14 +766,29 @@ class Interpreter{
     // "stopped" à true depuis l'extérieur (bouton "Arrêter") interrompt
     // proprement l'exécution au prochain point de contrôle.
     this.signal = signal;
+    // Tables des Fonctions/Procédures déclarées dans le programme (clé =
+    // nom normalisé via KW), peuplées au début de run().
+    this.functions = {};
+    this.procedures = {};
   }
 
   async run(program){
+    this.functions = program.functions || {};
+    this.procedures = program.procedures || {};
     for(const decl of program.declarations){
       if(decl.kind === 'scalar') this.env.declareScalar(decl.name, decl.type);
       else this.env.declareArray(decl.name, decl.size, decl.base);
     }
-    await this.execBlock(program.body);
+    try{
+      await this.execBlock(program.body);
+    } catch(e){
+      if(e instanceof ReturnSignal){
+        // "Retourner" utilisé hors de toute Fonction/Procédure : erreur
+        // pédagogique claire plutôt qu'un plantage silencieux.
+        throw new PseudoError('"Retourner" ne peut être utilisé qu\'à l\'intérieur d\'une Fonction ou d\'une Procédure.', e.line);
+      }
+      throw e;
+    }
   }
 
   async execBlock(block){ for(const stmt of block) await this.execStmt(stmt); }
@@ -633,15 +799,58 @@ class Interpreter{
     if(this.steps > this.maxSteps) throw new PseudoError("Nombre maximal d'opérations dépassé (boucle infinie ?).", line);
   }
 
+  /* Exécute le corps d'une Fonction/Procédure dans un environnement local
+     isolé (paramètres + variables locales), puis restaure l'environnement
+     appelant. `isFuncCall` détermine si une valeur de retour est exigée. */
+  async invokeCallable(decl, argValues, line, isFuncCall){
+    if(argValues.length !== decl.params.length){
+      throw new PseudoError(`"${decl.name}" attend ${decl.params.length} argument(s), reçu ${argValues.length}.`, line);
+    }
+
+    const callEnv = new Env();
+    decl.params.forEach((paramName, i) => {
+      callEnv.declareScalar(paramName, inferType(argValues[i]));
+      callEnv.set(paramName, argValues[i], line);
+    });
+    for(const d of decl.localDecls){
+      if(d.kind === 'scalar') callEnv.declareScalar(d.name, d.type);
+      else callEnv.declareArray(d.name, d.size, d.base);
+    }
+
+    const savedEnv = this.env;
+    this.env = callEnv;
+    let returnValue;
+    let didReturn = false;
+    try{
+      await this.execBlock(decl.body);
+    } catch(e){
+      if(e instanceof ReturnSignal){ returnValue = e.value; didReturn = true; }
+      else { this.env = savedEnv; throw e; }
+    }
+    this.env = savedEnv;
+
+    if(isFuncCall && !didReturn){
+      throw new PseudoError(`La fonction "${decl.name}" doit se terminer par "Retourner" (aucune valeur n'a été renvoyée).`, line);
+    }
+    return returnValue;
+  }
+
+  async callFunction(key, argValues, line){
+    return this.invokeCallable(this.functions[key], argValues, line, true);
+  }
+  async callProcedure(key, argValues, line){
+    return this.invokeCallable(this.procedures[key], argValues, line, false);
+  }
+
   async execStmt(stmt){
     this.bumpSteps(stmt.line);
     switch(stmt.type){
       case 'Affect': {
-        const val = evalExpr(stmt.expr, this.env, stmt.line);
+        const val = await evalExpr(stmt.expr, this.env, stmt.line, this);
         if(stmt.indexExpr){
           // Un tableau doit toujours être déclaré au préalable (sa taille est
           // nécessaire) : strictMode ne s'applique pas ici.
-          const idx = Math.trunc(evalExpr(stmt.indexExpr, this.env, stmt.line));
+          const idx = Math.trunc(await evalExpr(stmt.indexExpr, this.env, stmt.line, this));
           this.env.setIndex(stmt.name, idx, val, stmt.line);
         } else {
           if(!this.env.has(stmt.name) && !this.config.strictMode){
@@ -654,15 +863,16 @@ class Interpreter{
         break;
       }
       case 'Ecrire': {
-        const text = stmt.args.map(a => formatValue(evalExpr(a, this.env, stmt.line))).join('');
-        this.io.write(text);
+        const parts = [];
+        for(const a of stmt.args) parts.push(formatValue(await evalExpr(a, this.env, stmt.line, this)));
+        this.io.write(parts.join(''));
         break;
       }
       case 'Lire': {
         const raw = await this.io.readLine();
         if(stmt.indexExpr){
           const entry = this.env.getEntry(stmt.name, stmt.line);
-          const idx = Math.trunc(evalExpr(stmt.indexExpr, this.env, stmt.line));
+          const idx = Math.trunc(await evalExpr(stmt.indexExpr, this.env, stmt.line, this));
           const val = parseInputValue(raw, entry.base, stmt.name, stmt.line);
           this.env.setIndex(stmt.name, idx, val, stmt.line);
         } else {
@@ -673,13 +883,13 @@ class Interpreter{
         break;
       }
       case 'Si': {
-        if(truthy(evalExpr(stmt.cond, this.env, stmt.line))){
+        if(truthy(await evalExpr(stmt.cond, this.env, stmt.line, this))){
           await this.execBlock(stmt.then);
         } else {
           let handled = false;
           if(stmt.elifs){
             for(const branch of stmt.elifs){
-              if(truthy(evalExpr(branch.cond, this.env, stmt.line))){
+              if(truthy(await evalExpr(branch.cond, this.env, stmt.line, this))){
                 await this.execBlock(branch.block);
                 handled = true;
                 break;
@@ -691,9 +901,9 @@ class Interpreter{
         break;
       }
       case 'Pour': {
-        const from = Math.trunc(evalExpr(stmt.from, this.env, stmt.line));
-        const to = Math.trunc(evalExpr(stmt.to, this.env, stmt.line));
-        const step = stmt.step ? Math.trunc(evalExpr(stmt.step, this.env, stmt.line)) : 1;
+        const from = Math.trunc(await evalExpr(stmt.from, this.env, stmt.line, this));
+        const to = Math.trunc(await evalExpr(stmt.to, this.env, stmt.line, this));
+        const step = stmt.step ? Math.trunc(await evalExpr(stmt.step, this.env, stmt.line, this)) : 1;
         if(step === 0) throw new PseudoError('Le "Pas" de la boucle "Pour" ne peut pas être 0.', stmt.line);
         if(!this.env.has(stmt.varName)) this.env.declareScalar(stmt.varName, 'entier');
         for(let i = from; step > 0 ? i <= to : i >= to; i += step){
@@ -705,7 +915,7 @@ class Interpreter{
         break;
       }
       case 'TantQue': {
-        while(truthy(evalExpr(stmt.cond, this.env, stmt.line))){
+        while(truthy(await evalExpr(stmt.cond, this.env, stmt.line, this))){
           await this.execBlock(stmt.body);
           this.bumpSteps(stmt.line);
           if(this.steps % 1000 === 0) await sleep0();
@@ -719,14 +929,14 @@ class Interpreter{
           await this.execBlock(stmt.body);
           this.bumpSteps(stmt.line);
           if(this.steps % 1000 === 0) await sleep0();
-        } while(!truthy(evalExpr(stmt.cond, this.env, stmt.line)));
+        } while(!truthy(await evalExpr(stmt.cond, this.env, stmt.line, this)));
         break;
       }
       case 'Selon': {
-        const switchVal = evalExpr(stmt.expr, this.env, stmt.line);
+        const switchVal = await evalExpr(stmt.expr, this.env, stmt.line, this);
         let matched = false;
         for(const c of stmt.cases){
-          const caseVal = evalExpr(c.value, this.env, stmt.line);
+          const caseVal = await evalExpr(c.value, this.env, stmt.line, this);
           if(compareEq(switchVal, caseVal)){
             await this.execBlock(c.block);
             matched = true;
@@ -735,6 +945,21 @@ class Interpreter{
         }
         if(!matched && stmt.default) await this.execBlock(stmt.default);
         break;
+      }
+      case 'AppelProcedure': {
+        const key = KW(stmt.name);
+        const argValues = [];
+        for(const a of stmt.args) argValues.push(await evalExpr(a, this.env, stmt.line, this));
+
+        if(this.procedures[key]){ await this.callProcedure(key, argValues, stmt.line); break; }
+        if(this.functions[key]){ await this.callFunction(key, argValues, stmt.line); break; } // résultat ignoré
+        const builtin = BUILTIN_FUNCTIONS[key];
+        if(builtin){ builtin(argValues, stmt.line, stmt.name); break; } // résultat ignoré
+        throw new PseudoError(`"${stmt.name}" n'est ni une procédure ni une fonction connue.`, stmt.line);
+      }
+      case 'Retourner': {
+        const value = stmt.expr ? await evalExpr(stmt.expr, this.env, stmt.line, this) : undefined;
+        throw new ReturnSignal(value, stmt.line);
       }
       default:
         throw new PseudoError('Instruction inconnue.', stmt.line);
@@ -846,6 +1071,8 @@ const HL_CONTROL_KEYWORDS = new Set([
   'pour', 'de', 'a', 'pas', 'faire', 'finpour',
   'tantque', 'fintantque', 'repeter', "jusqu'a",
   'lire', 'ecrire',
+  'fonction', 'finfonction', 'procedure', 'finprocedure',
+  'retourner', 'retourne', 'appeler',
 ]);
 const HL_LOGIC_WORDS = new Set(['et', 'ou', 'non', 'mod', 'div']);
 const HL_BOOL_WORDS = new Set(['vrai', 'faux']);
@@ -909,6 +1136,8 @@ const AC_KEYWORDS = [
   'TantQue', 'FinTantQue',
   'Répéter', "Jusqu'à",
   'Lire', 'Ecrire', 'Ord',
+  'Fonction', 'FinFonction', 'Procédure', 'FinProcédure',
+  'Retourner', 'Appeler',
   'Et', 'Ou', 'Non', 'Mod', 'Div', 'Vrai', 'Faux',
   'Entier', 'Réel', 'Chaîne', 'Booléen', 'Caractère', 'Tableau', 'de',
 ];
@@ -1413,7 +1642,11 @@ function openSyntaxGuide(){
     <p><code>Répéter … Jusqu'à cond</code> (corps exécuté au moins une fois)</p>
     <h3>Entrées / sorties</h3>
     <p><code>Lire(variable)</code> — <code>Ecrire("texte", variable, …)</code></p>
-    <h3>Fonctions</h3>
+    <h3>Fonctions &amp; Procédures</h3>
+    <p><code>Fonction Nom(p1, p2) : Type … Début … Retourner valeur … FinFonction</code></p>
+    <p><code>Procédure Nom(p1, p2) … Début … FinProcédure</code> (pas de retour)</p>
+    <p>Appel : <code>x &lt;- Nom(a, b)</code> pour une fonction — <code>Appeler Nom(a, b)</code> ou <code>Nom(a, b)</code> seul pour une procédure.</p>
+    <h3>Fonctions intégrées</h3>
     <p><code>Ord(car)</code> renvoie le code numérique (ASCII/Unicode) du caractère <code>car</code>. Ex. : <code>Ord("A")</code> vaut 65.</p>
     <h3>Opérateurs</h3>
     <p>Arithmétiques : <code>+ - * / Mod Div</code> — Comparaison : <code>= &lt;&gt; &lt; &gt; &lt;= &gt;=</code> — Logiques : <code>Et Ou Non</code></p>
